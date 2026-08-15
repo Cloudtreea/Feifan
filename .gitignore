@@ -1,0 +1,20 @@
+# 生成产物与临时文件
+/output/
+/tmp/
+
+# 日志与缓存
+*.log
+*.tmp
+*.temp
+*.cache
+
+# 编辑器配置
+/.vscode/
+/.idea/
+*.swp
+*.swo
+
+# 操作系统文件
+.DS_Store
+Thumbs.db
+desktop.ini
