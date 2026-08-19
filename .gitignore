@@ -7,6 +7,10 @@
 *.tmp
 *.temp
 *.cache
+*.db
+__pycache__/
+.pytest_cache/
+.venv/
 
 # 编辑器配置
 /.vscode/
