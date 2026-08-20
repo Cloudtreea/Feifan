@@ -30,6 +30,46 @@ MODULE_ALIASES = {
 }
 
 
+def load_question_bank_manifest():
+    path = os.path.join(BASE_DIR, "question_bank_manifest.json")
+    with open(path, "r", encoding="utf-8") as handle:
+        manifest = json.load(handle)
+    totals = manifest.get("knowledgeTotals", {})
+    if set(totals) != {"ancient", "modern", "world"} or any(int(value) <= 0 for value in totals.values()):
+        raise RuntimeError("question_bank_manifest.json contains invalid knowledge totals")
+    manifest["knowledgeTotals"] = {key: int(value) for key, value in totals.items()}
+    return manifest
+
+
+QUESTION_BANK_MANIFEST = load_question_bank_manifest()
+MODULE_KNOWLEDGE_TOTALS = QUESTION_BANK_MANIFEST["knowledgeTotals"]
+MASTERY_UNSEEN_PRIOR = 35
+MASTERY_COVERAGE_EXPONENT = 0.65
+
+
+def coverage_adjusted_mastery(observed_average, practiced_count, total_count):
+    """Blend observed performance with a neutral prior until coverage is sufficient."""
+    total = max(1, int(total_count or 0))
+    practiced = max(0, min(total, int(practiced_count or 0)))
+    if not practiced or observed_average is None:
+        return 0, 0, 0
+    coverage = practiced / total
+    reliability = coverage ** MASTERY_COVERAGE_EXPONENT
+    adjusted = round(float(observed_average) * reliability + MASTERY_UNSEEN_PRIOR * (1 - reliability))
+    return max(0, min(100, adjusted)), round(coverage * 100), round(reliability * 100)
+
+
+def mastery_evidence_state(score, coverage_percent, practiced_count):
+    """Describe whether the current percentage is sufficiently supported for teaching use."""
+    if practiced_count == 0 or coverage_percent < 30:
+        return {"key": "insufficient", "label": "证据不足"}
+    if score < 65:
+        return {"key": "weak", "label": "暴露薄弱"}
+    if score >= 85 and coverage_percent >= 60:
+        return {"key": "stable", "label": "稳定掌握"}
+    return {"key": "developing", "label": "持续积累"}
+
+
 class SchoolClass(db.Model):
     __tablename__ = "school_classes"
     id = db.Column(db.String(32), primary_key=True)
@@ -122,17 +162,26 @@ def normalized_module(value):
     return MODULE_ALIASES.get(value, "ancient")
 
 
-def evidence_score(result):
+BOARD_EVIDENCE_ADJUST = {3: -6, 4: 0, 5: 6}
+
+
+def evidence_score(result, board_size=3):
     if not result.get("completed", True):
         score = 20
     else:
         wrong = int(result.get("wrongAttempts", 0) or 0)
-        score = 100 if wrong == 0 else 85 if wrong == 1 else 70
+        score = 96 if wrong == 0 else 80 if wrong == 1 else max(48, 80 - (wrong - 1) * 12)
+        score += BOARD_EVIDENCE_ADJUST.get(int(board_size or 3), 0)
+        score += {"识记": -2, "理解": 2, "辨析": 4}.get(result.get("cognitiveLevel"), 0)
     if result.get("clueVisible"):
         score *= 0.97
     if result.get("hintUsed"):
         score *= 0.95
-    return round(score)
+    if result.get("checkpointCorrect") is True:
+        score += 10
+    elif result.get("checkpointCorrect") is False:
+        score -= 12
+    return max(0, min(100, round(score)))
 
 
 def mastery_status(score):
@@ -200,9 +249,10 @@ def ingest_completed_session(event):
     results = event.get("pairResults") or []
     raw_wrong = sum(int(item.get("rawWrongAttempts", 0) or 0) for item in results)
     exemptions = sum(int(item.get("firstRevealExemptions", 0) or 0) for item in results)
+    board_size = int(event.get("boardSize", 3) or 3)
     db.session.add(GameSession(
         session_id=session_id, student_id=student_id, module_id=module_id,
-        relation_type=event.get("relationType"), board_size=int(event.get("boardSize", 3) or 3),
+        relation_type=event.get("relationType"), board_size=board_size,
         completed_at=occurred_at, game_score=int(event.get("gameScore", 0) or 0),
         independent_accuracy=int(event.get("independentAccuracy", 0) or 0),
         assessed_wrong_attempts=int(event.get("assessedWrongAttempts", 0) or 0),
@@ -216,7 +266,7 @@ def ingest_completed_session(event):
             continue
         db.session.add(PairResult(
             session_id=session_id, student_id=student_id, module_id=module_id,
-            pair_id=pair_id, knowledge_id=knowledge_id, evidence_score=evidence_score(item),
+            pair_id=pair_id, knowledge_id=knowledge_id, evidence_score=evidence_score(item, board_size),
             wrong_attempts=int(item.get("wrongAttempts", 0) or 0),
             raw_wrong_attempts=int(item.get("rawWrongAttempts", 0) or 0),
             first_reveal_exemptions=int(item.get("firstRevealExemptions", 0) or 0),
@@ -228,7 +278,9 @@ def ingest_completed_session(event):
 
 
 def student_rows(grade, class_id):
-    query = Student.query.filter_by(grade_id=grade)
+    query = Student.query
+    if grade != "all":
+        query = query.filter_by(grade_id=grade)
     if class_id != "all":
         query = query.filter_by(class_id=class_id)
     return query.all()
@@ -236,10 +288,20 @@ def student_rows(grade, class_id):
 
 def student_metrics(student):
     sessions = GameSession.query.filter_by(student_id=student.id).all()
-    scores = {}
+    scores, coverage = {}, {}
     for module in MODULES:
-        value = db.session.query(func.avg(MasterySnapshot.score)).filter_by(student_id=student.id, module_id=module).scalar()
-        scores[module] = round(value) if value is not None else 0
+        rows = MasterySnapshot.query.filter_by(student_id=student.id, module_id=module).all()
+        practiced = len({row.knowledge_id for row in rows})
+        observed = sum(row.score for row in rows) / len(rows) if rows else None
+        total = MODULE_KNOWLEDGE_TOTALS[module]
+        score, percent, reliability = coverage_adjusted_mastery(observed, practiced, total)
+        scores[module] = score
+        coverage[module] = {
+            "practiced": practiced, "total": total, "percent": percent,
+            "observedAverage": round(observed) if observed is not None else 0,
+            "reliability": reliability,
+            "state": mastery_evidence_state(score, percent, practiced),
+        }
     latest = max((row.completed_at for row in sessions), default=None)
     last = 999 if latest is None else max(0, (utcnow().date() - latest.date()).days)
     pair_count = PairResult.query.filter_by(student_id=student.id).count()
@@ -247,19 +309,31 @@ def student_metrics(student):
     return {
         "id": student.id, "name": student.display_name, "grade": student.grade_id,
         "clazz": student.class_id, "className": db.session.get(SchoolClass, student.class_id).name,
-        "scores": scores, "games": len(sessions), "hints": round(hint_count / max(1, pair_count) * 100), "last": last,
+        "scores": scores, "coverage": coverage,
+        "learningState": next((item["state"] for item in coverage.values() if item["state"]["key"] == "weak"),
+                              next((item["state"] for item in coverage.values() if item["state"]["key"] == "insufficient"),
+                                   {"key": "stable", "label": "稳定掌握"}
+                                   if coverage and all(item["state"]["key"] == "stable" for item in coverage.values())
+                                   else {"key": "developing", "label": "持续积累"})),
+        "games": len(sessions),
+        "hints": round(hint_count / max(1, pair_count) * 100), "last": last,
     }
 
 
 def aggregate(metrics):
     count = len(metrics)
     mods = {module: round(sum(row["scores"][module] for row in metrics) / max(1, count)) for module in MODULES}
+    coverage = {
+        module: round(sum(row["coverage"][module]["percent"] for row in metrics) / max(1, count))
+        for module in MODULES
+    }
     practiced = [value for row in metrics for value in row["scores"].values() if value > 0]
     return {
         "count": count, "active": sum(row["last"] < 7 for row in metrics),
         "games": sum(row["games"] for row in metrics),
         "average": round(sum(practiced) / len(practiced)) if practiced else 0,
-        "mods": mods, "risk": sum(any(0 < value < 65 for value in row["scores"].values()) for row in metrics),
+        "mods": mods, "coverage": coverage,
+        "risk": sum(row["learningState"]["key"] == "weak" for row in metrics),
     }
 
 
@@ -280,7 +354,9 @@ def teacher_page():
 
 @app.get("/api/health")
 def health():
-    return jsonify(status="ok", database="connected", timestamp=utcnow().isoformat())
+    return jsonify(status="ok", database="connected", timestamp=utcnow().isoformat(),
+                   questionBank={"version": QUESTION_BANK_MANIFEST["version"],
+                                 "knowledgeTotals": MODULE_KNOWLEDGE_TOTALS})
 
 
 @app.post("/api/v1/learning-events/batch")
@@ -314,10 +390,13 @@ def receive_events():
 
 @app.get("/api/v1/teacher/dashboard")
 def teacher_dashboard():
-    grade, class_id = request.args.get("grade", "g2"), request.args.get("clazz", "all")
+    grade, class_id = request.args.get("grade", "all"), request.args.get("clazz", "all")
     students = student_rows(grade, class_id)
     metrics = [student_metrics(student) for student in students]
-    classes = SchoolClass.query.filter_by(grade_id=grade).order_by(SchoolClass.id).all()
+    classes_query = SchoolClass.query
+    if grade != "all":
+        classes_query = classes_query.filter_by(grade_id=grade)
+    classes = classes_query.order_by(SchoolClass.id).all()
     if class_id != "all":
         classes = [item for item in classes if item.id == class_id]
     since = utcnow().date() - timedelta(days=6)
@@ -343,7 +422,7 @@ def teacher_dashboard():
 
 @app.get("/api/v1/teacher/students")
 def teacher_students():
-    grade, class_id = request.args.get("grade", "g2"), request.args.get("clazz", "all")
+    grade, class_id = request.args.get("grade", "all"), request.args.get("clazz", "all")
     module, status = request.args.get("module", "all"), request.args.get("status", "all")
     search = request.args.get("search", "").lower()
     page, page_size = max(1, request.args.get("page", 1, type=int)), min(50, request.args.get("pageSize", 8, type=int))
@@ -351,9 +430,9 @@ def teacher_students():
     if search:
         rows = [row for row in rows if search in row["id"].lower() or search in row["name"].lower()]
     if status == "risk":
-        rows = [row for row in rows if any(0 < score < 65 for score in row["scores"].values())]
+        rows = [row for row in rows if row["learningState"]["key"] == "weak"]
     elif status == "good":
-        rows = [row for row in rows if row["games"] and min(row["scores"].values()) >= 85]
+        rows = [row for row in rows if row["learningState"]["key"] == "stable"]
     key = (lambda row: min(row["scores"].values())) if module == "all" else (lambda row: row["scores"].get(module, 0))
     rows.sort(key=key)
     start = (page - 1) * page_size
@@ -368,13 +447,29 @@ def teacher_student(student_id):
     metrics = student_metrics(student)
     sessions = GameSession.query.filter_by(student_id=student_id).order_by(GameSession.completed_at.desc()).limit(5).all()
     recent = [{"module": row.module_id, "done": True, "hints": row.hint_count,
+               "boardSize": row.board_size, "gameScore": row.game_score,
                "accuracy": row.independent_accuracy, "rawWrongAttempts": row.raw_wrong_attempts,
                "assessedWrongAttempts": row.assessed_wrong_attempts,
                "firstRevealExemptions": row.first_reveal_exemptions,
                "date": row.completed_at.isoformat()} for row in sessions]
     evidence = PairResult.query.filter_by(student_id=student_id).order_by(PairResult.occurred_at.desc()).limit(20).all()
+    session_ids = {row.session_id for row in evidence}
+    board_by_session = {row.session_id: row.board_size for row in GameSession.query.filter(GameSession.session_id.in_(session_ids)).all()} if session_ids else {}
+    evidence_counts = {}
+    evidence_boards = {}
+    for row in PairResult.query.filter_by(student_id=student_id).all():
+        evidence_counts[row.knowledge_id] = evidence_counts.get(row.knowledge_id, 0) + 1
+        board = board_by_session.get(row.session_id)
+        if board is None:
+            session = GameSession.query.filter_by(session_id=row.session_id).first()
+            board = session.board_size if session else 3
+        evidence_boards.setdefault(row.knowledge_id, set()).add(board)
     return jsonify(student=metrics, recent=recent, evidence=[{
         "knowledgeId": row.knowledge_id, "module": row.module_id, "score": row.evidence_score,
+        "boardSize": board_by_session.get(row.session_id, 3),
+        "evidenceCount": evidence_counts.get(row.knowledge_id, 1),
+        "confidence": ("高" if evidence_counts.get(row.knowledge_id, 1) >= 5 and len(evidence_boards.get(row.knowledge_id, ())) >= 2
+                       else "中" if evidence_counts.get(row.knowledge_id, 1) >= 3 or max(evidence_boards.get(row.knowledge_id, {3})) >= 5 else "低"),
         "wrongAttempts": row.wrong_attempts, "rawWrongAttempts": row.raw_wrong_attempts,
         "firstRevealExemptions": row.first_reveal_exemptions, "hintUsed": row.hint_used,
         "clueVisible": row.clue_visible, "date": row.occurred_at.isoformat(),

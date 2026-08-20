@@ -48,7 +48,32 @@ class ApiTest(unittest.TestCase):
             self.assertEqual(result.wrong_attempts, 0)
             self.assertEqual(result.raw_wrong_attempts, 1)
             self.assertEqual(result.first_reveal_exemptions, 1)
-            self.assertEqual(result.evidence_score, 100)
+            self.assertEqual(result.evidence_score, 90)
+
+    def test_board_load_calibrates_evidence(self):
+        from app import evidence_score
+        result = {"completed": True, "wrongAttempts": 1, "hintUsed": False,
+                  "clueVisible": False, "cognitiveLevel": "理解"}
+        self.assertLess(evidence_score(result, 3), evidence_score(result, 4))
+        self.assertLess(evidence_score(result, 4), evidence_score(result, 5))
+
+    def test_limited_coverage_cannot_produce_high_module_mastery(self):
+        self.client.post("/api/v1/learning-events/batch", json={"events": [self.event()]})
+        detail = self.client.get("/api/v1/teacher/students/demo-s2101").json["student"]
+        coverage = detail["coverage"]["ancient"]
+        self.assertEqual(coverage["practiced"], 1)
+        self.assertEqual(coverage["total"], 43)
+        self.assertLess(detail["scores"]["ancient"], 50)
+        self.assertGreater(detail["scores"]["ancient"], 35)
+        self.assertEqual(coverage["state"]["key"], "insufficient")
+        self.assertEqual(detail["learningState"]["label"], "证据不足")
+
+    def test_evidence_state_distinguishes_coverage_and_performance(self):
+        from app import mastery_evidence_state
+        self.assertEqual(mastery_evidence_state(95, 10, 4)["key"], "insufficient")
+        self.assertEqual(mastery_evidence_state(58, 45, 18)["key"], "weak")
+        self.assertEqual(mastery_evidence_state(75, 45, 18)["key"], "developing")
+        self.assertEqual(mastery_evidence_state(90, 70, 28)["key"], "stable")
 
     def test_teacher_endpoints(self):
         self.client.post("/api/v1/learning-events/batch", json={"events": [self.event()]})
