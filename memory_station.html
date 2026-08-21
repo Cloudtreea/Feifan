@@ -117,8 +117,8 @@
     }
     .board{background:linear-gradient(145deg,#dcece5,#cfe3dc);border-color:#fffaf0;box-shadow:inset 0 0 0 2px #9fc8bd,0 14px 30px #356c6024}
     @media (min-width:760px) and (min-height:480px) and (orientation:landscape){
-      .game{grid-template-columns:minmax(0,20%) minmax(0,56%) minmax(0,24%)!important;justify-content:stretch!important}
-      .board,.board[data-size="3"],.board[data-size="4"],.board[data-size="5"]{grid-column:2!important;grid-row:1 / span 4!important;display:grid!important;visibility:visible!important;justify-self:center!important;width:min(100%,calc(100dvh - 40px))!important;min-width:0!important;max-width:840px!important}
+      .game{grid-template-columns:minmax(0,18%) minmax(0,62%) minmax(0,20%)!important;justify-content:stretch!important;align-content:start!important}
+      .board,.board[data-size="3"],.board[data-size="4"],.board[data-size="5"]{grid-column:2!important;grid-row:1 / span 4!important;display:grid!important;visibility:visible!important;align-self:start!important;justify-self:center!important;margin:0 auto!important;width:min(100%,calc(100dvh - 24px))!important;min-width:0!important;max-width:960px!important}
       .clue-panel{grid-column:1!important}.game .game-nav,.metrics,.game-info,.game-actions{grid-column:3!important}
     }
     .game-actions{display:grid;gap:8px}.game-actions button[hidden]{display:none!important}
